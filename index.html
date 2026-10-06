@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BrowserStack Live Viewer</title>
+<style>
+  :root { color-scheme: dark; --bg:#111; --panel:#1b1b1d; --line:#333; --fg:#eee; --mute:#9aa; --ok:#4cd964; --bad:#ff5f56; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px system-ui,sans-serif; display:flex; gap:16px; padding:16px; min-height:100vh; }
+  #side { width:340px; flex:none; display:flex; flex-direction:column; gap:10px; }
+  label { display:block; color:var(--mute); font-size:12px; margin-bottom:3px; }
+  input { width:100%; padding:8px; background:var(--panel); border:1px solid var(--line); color:var(--fg); border-radius:6px; font:inherit; }
+  .row { display:flex; gap:8px; }
+  button { padding:8px 12px; background:#2b6cff; border:0; color:#fff; border-radius:6px; font:inherit; cursor:pointer; }
+  button.alt { background:#333; }
+  button:disabled { opacity:.4; cursor:default; }
+  #status { padding:8px; background:var(--panel); border:1px solid var(--line); border-radius:6px; }
+  #stats { font:12px ui-monospace,monospace; color:var(--mute); white-space:pre; }
+  #log { flex:1; min-height:120px; max-height:40vh; overflow:auto; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px; font:11px ui-monospace,monospace; color:var(--mute); }
+  #stage { flex:1; display:flex; justify-content:center; align-items:flex-start; }
+  video { max-height:calc(100vh - 32px); max-width:100%; background:#000; border-radius:8px; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  @media (max-width:760px) { body { flex-direction:column; } #side { width:auto; } video { max-height:70vh; } }
+</style>
+</head>
+<body>
+<div id="side">
+  <div><label for="session">Session id (dashboard URL: .../sessions/&lt;id&gt;)</label><input id="session" autocomplete="off" spellcheck="false"></div>
+  <div><label for="uid">User id (uid= on the dashboard's wspool socket)</label><input id="uid" autocomplete="off" inputmode="numeric"></div>
+  <div class="row">
+    <button id="go">Connect</button>
+    <button id="stop" class="alt" disabled>Disconnect</button>
+    <button id="snap" class="alt" disabled>Snapshot</button>
+  </div>
+  <div id="status">idle</div>
+  <div id="stats"></div>
+  <div id="log"></div>
+</div>
+<div id="stage"><video id="v" autoplay muted playsinline controls></video></div>
+
+<script>
+"use strict";
+const SIGNAL = "wss://peer-alb-aps1-prod.browserstack.com/socket.io/";
+const ICE = [{ urls: [
+  "stun:turn-live-007-dcm-aps1c-prod.browserstack.com:443",
+  "stun:turn-live-008-dcm-aps1c-prod.browserstack.com:443",
+  "stun:turn-live-006-ec2-aps1b-prod.browserstack.com:443",
+  "stun:turn-lse-001-ec2-aps1a-prod.browserstack.com:443",
+  "stun:stun.l.google.com:19302" ] }];
+
+const $ = id => document.getElementById(id);
+const q = new URLSearchParams(location.search);
+const store = { get(k){ try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+                set(k,v){ try { localStorage.setItem(k,v); } catch {} } };
+$("session").value = q.get("session") || store.get("session");
+$("uid").value = q.get("uid") || store.get("uid");
+
+let ws, pinger, statsTimer, pcs = {}, pending = {}, session, uid, closing = false;
+
+function log(msg, cls) {
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = new Date().toLocaleTimeString() + "  " + msg;
+  $("log").appendChild(d); $("log").scrollTop = 1e9;
+}
+function setStatus(t, cls) { $("status").textContent = t; $("status").className = cls || ""; }
+
+const emit = (ev, payload) => ws.send("42" + JSON.stringify([ev, payload]));
+const msg = (peer, type, message) => ({
+  type, message, channel: session + (peer === "dataPeer" ? "_data" : ""),
+  user_id: Number(uid), sender: "client:", peer_type: peer, live_session_id: session });
+
+function connect() {
+  session = $("session").value.trim(); uid = $("uid").value.trim();
+  if (!session || !uid) { setStatus("session id and user id are required", "bad"); return; }
+  store.set("session", session); store.set("uid", uid);
+  closing = false; pcs = {}; pending = {};
+  $("go").disabled = true; $("stop").disabled = false;
+  setStatus("connecting to signaling…");
+  const url = SIGNAL + "?" + new URLSearchParams({ tag:"wspool", uid, js:"v71.16", browser:"chrome", os:"win",
+    subdomain:"app-automate", iov:"IO201", EIO:"3", transport:"websocket" });
+  ws = new WebSocket(url);
+  ws.onopen = () => log("signaling socket open");
+  ws.onerror = () => log("signaling socket error (origin rejected, or network)", "bad");
+  ws.onclose = e => {
+    clearInterval(pinger);
+    log("signaling closed (" + e.code + ")");
+    if (!closing) setStatus("signaling closed — no stream (code " + e.code + ")", "bad");
+    $("go").disabled = false; $("stop").disabled = true;
+  };
+  ws.onmessage = async e => {
+    const m = e.data;
+    if (m[0] === "0") {
+      const info = JSON.parse(m.slice(1));
+      pinger = setInterval(() => ws.readyState === 1 && ws.send("2"), info.pingInterval || 25000);
+      setTimeout(hello, 500);
+    } else if (m.startsWith("42")) {
+      const [ev, p] = JSON.parse(m.slice(2));
+      if (ev === "server_info") log("server_info " + JSON.stringify(p));
+      else if (ev === "message" && p && p.sender === "server:") onServer(p).catch(err => log("error: " + err, "bad"));
+    }
+  };
+}
+
+function hello() {
+  emit("message", { type:"customMessage", message:"webrtc client connected", channel:{}, user_id:Number(uid), sender:"client:" });
+  setTimeout(() => {
+    emit("message", msg("screenPeer", "init", "{}"));
+    emit("message", msg("dataPeer", "init", "{}"));
+    setStatus("waiting for the device offer… (close any other open viewer of this session)");
+  }, 300);
+}
+
+async function onServer(d) {
+  const peer = d.peer_type;
+  if (peer !== "screenPeer" && peer !== "dataPeer") return;
+  if (d.type === "offer" || String(d.message || "").startsWith("v=0")) await onOffer(peer, d);
+  else if (d.type === "fullcandidate") {
+    const pc = pcs[peer];
+    if (!pc || !pc.remoteDescription) (pending[peer] = pending[peer] || []).push(d);
+    else await addCandidate(pc, d);
+  }
+}
+
+async function addCandidate(pc, d) {
+  try {
+    const c = typeof d.message === "string" ? JSON.parse(d.message) : d.message;
+    if (c && c.candidate) await pc.addIceCandidate({ candidate:c.candidate, sdpMid:c.sdpMid, sdpMLineIndex:c.sdpMLineIndex });
+  } catch (err) { log("candidate skipped: " + err); }
+}
+
+async function onOffer(peer, d) {
+  log("offer received for " + peer);
+  const pc = new RTCPeerConnection({ iceServers: ICE });
+  pcs[peer] = pc;
+  pc.onicecandidate = ev => {
+    if (!ev.candidate || ws.readyState !== 1) return;
+    const c = ev.candidate;
+    emit("message", msg(peer, "fullcandidate", JSON.stringify({
+      candidate:c.candidate, sdpMid:c.sdpMid, sdpMLineIndex:c.sdpMLineIndex, usernameFragment:c.usernameFragment })));
+  };
+  pc.onconnectionstatechange = () => {
+    log(peer + " connection: " + pc.connectionState, pc.connectionState === "connected" ? "ok" : "");
+    if (peer === "screenPeer") {
+      if (pc.connectionState === "connected") setStatus("LIVE", "ok");
+      if (pc.connectionState === "failed") setStatus("connection failed", "bad");
+    }
+  };
+  pc.ondatachannel = ev => log("datachannel: " + ev.channel.label);
+  pc.ontrack = ev => {
+    log("track: " + ev.track.kind);
+    if (ev.track.kind === "video") {
+      $("v").srcObject = ev.streams[0] || new MediaStream([ev.track]);
+      $("v").play().catch(() => {});
+      $("snap").disabled = false;
+      startStats(pc);
+    }
+  };
+  await pc.setRemoteDescription({ type: "offer", sdp: d.message });
+  pc.getTransceivers().forEach(t => { if (t.receiver.track.kind === "video") t.direction = "recvonly"; });
+  await pc.setLocalDescription(await pc.createAnswer());
+  emit("message", msg(peer, "answer", pc.localDescription.sdp));
+  log("answer sent for " + peer);
+  for (const c of pending[peer] || []) await addCandidate(pc, c);
+  pending[peer] = [];
+}
+
+function startStats(pc) {
+  clearInterval(statsTimer);
+  let last = null;
+  statsTimer = setInterval(async () => {
+    for (const r of (await pc.getStats()).values()) {
+      if (r.type !== "inbound-rtp" || r.kind !== "video") continue;
+      const now = performance.now();
+      if (last) {
+        const dt = (now - last.t) / 1000;
+        $("stats").textContent =
+          `${r.frameWidth}x${r.frameHeight}   ${((r.framesDecoded - last.f) / dt).toFixed(1)} fps   ` +
+          `${(((r.bytesReceived - last.b) * 8) / dt / 1000).toFixed(0)} kbps\nframes decoded: ${r.framesDecoded}`;
+      }
+      last = { t: now, f: r.framesDecoded, b: r.bytesReceived };
+    }
+  }, 1000);
+}
+
+function disconnect() {
+  closing = true;
+  clearInterval(statsTimer);
+  Object.values(pcs).forEach(pc => pc.close());
+  pcs = {};
+  if (ws) ws.close();
+  $("v").srcObject = null; $("snap").disabled = true; $("stats").textContent = "";
+  setStatus("disconnected");
+}
+
+$("go").onclick = connect;
+$("stop").onclick = disconnect;
+$("snap").onclick = () => {
+  const v = $("v"), c = document.createElement("canvas");
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext("2d").drawImage(v, 0, 0);
+  const a = document.createElement("a");
+  a.href = c.toDataURL("image/png"); a.download = "device-" + Date.now() + ".png"; a.click();
+};
+addEventListener("beforeunload", () => { try { ws && ws.close(); } catch {} });
+if (q.get("autoconnect") !== null && $("session").value && $("uid").value) connect();
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Pinned to versions that ship binary wheels for Python 3.9 on Windows
+aiortc==1.9.0
+av>=12,<13
+websockets>=14
+aiohttp
+opencv-python-headless
+numpy
