@@ -73,6 +73,18 @@ $("uid").value = q.get("uid") || store.get("uid");
 let ws, pinger, statsTimer, pcs = {}, pending = {}, session, uid, closing = false, rtcConfig = { iceServers: ICE };
 const DEFAULT_SIGNAL = SIGNAL;
 
+function normalizeServer(x) {
+  const urls = [].concat(x.urls || x.url || []).map(u => String(u).replace(/[\s​"']+/g, ""));
+  const o = { urls };
+  if (x.username != null) o.username = String(x.username).trim();
+  if (x.credential != null) o.credential = String(x.credential).trim();
+  return o;
+}
+function usable(s) {
+  try { new RTCPeerConnection({ iceServers: [s] }).close(); return true; }
+  catch (e) { log("dropped invalid ICE server " + JSON.stringify(s.urls) + ": " + e.message, "bad"); return false; }
+}
+
 function buildConfig() {
   const cfg = { iceServers: ICE.slice() };
   SIGNAL = DEFAULT_SIGNAL;
@@ -80,7 +92,8 @@ function buildConfig() {
   if (raw) {
     const j = JSON.parse(raw);
     if (j.peer) SIGNAL = String(j.peer).replace(/^http/, "ws").replace(/\/*$/, "/socket.io/");
-    cfg.iceServers = (j.iceServers || []).concat(ICE);
+    const list = [].concat(j.iceServers || j.ice_servers || j);
+    cfg.iceServers = list.map(normalizeServer).filter(usable).concat(ICE);
     log("relay config loaded: " + (j.iceServers || []).length + " ice servers" + (j.peer ? ", signaling " + new URL(j.peer).host : ""));
   }
   if ($("forceRelay").checked) { cfg.iceTransportPolicy = "relay"; log("forcing relay-only"); }
