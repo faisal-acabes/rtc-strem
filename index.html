@@ -12,6 +12,8 @@
   label { display:block; color:var(--mute); font-size:12px; margin-bottom:3px; }
   input { width:100%; padding:8px; background:var(--panel); border:1px solid var(--line); color:var(--fg); border-radius:6px; font:inherit; }
   .row { display:flex; gap:8px; }
+  textarea { width:100%; padding:8px; background:var(--panel); border:1px solid var(--line); color:var(--fg); border-radius:6px; font:11px ui-monospace,monospace; }
+  summary { cursor:pointer; color:var(--mute); }
   button { padding:8px 12px; background:#2b6cff; border:0; color:#fff; border-radius:6px; font:inherit; cursor:pointer; }
   button.alt { background:#333; }
   button:disabled { opacity:.4; cursor:default; }
@@ -28,6 +30,13 @@
 <div id="side">
   <div><label for="session">Session id (dashboard URL: .../sessions/&lt;id&gt;)</label><input id="session" autocomplete="off" spellcheck="false"></div>
   <div><label for="uid">User id (uid= on the dashboard's wspool socket)</label><input id="uid" autocomplete="off" inputmode="numeric"></div>
+  <details id="relay">
+    <summary>Relay config (needed on restricted networks)</summary>
+    <p style="color:var(--mute);font-size:12px;margin:6px 0">If the connection fails after "connecting", your network is blocking direct WebRTC. Open your BrowserStack session page, press F12, paste the snippet into the Console, press Enter, press Ctrl+C then Enter in the box that appears, then paste the result below.</p>
+    <div class="row"><button id="copysnip" class="alt" type="button">Copy snippet</button></div>
+    <textarea id="cfg" rows="3" placeholder='{"peer":"...","iceServers":[...]}' spellcheck="false"></textarea>
+    <label style="margin-top:6px"><input id="forceRelay" type="checkbox" style="width:auto"> force relay (test)</label>
+  </details>
   <div class="row">
     <button id="go">Connect</button>
     <button id="stop" class="alt" disabled>Disconnect</button>
@@ -41,7 +50,12 @@
 
 <script>
 "use strict";
-const SIGNAL = "wss://peer-alb-aps1-prod.browserstack.com/socket.io/";
+let SIGNAL = "wss://peer-alb-aps1-prod.browserstack.com/socket.io/";
+// Paste in the console of your BrowserStack session page: shows a prompt with the relay config to copy (console copy() is shadowed by the dashboard).
+const SNIPPET = "prompt('Press Ctrl+C then Enter',JSON.stringify(await (async()=>{const t=await (await fetch('/api/v1/sessions/'+location.pathname.split('/sessions/')[1].split(/[/?#]/)[0],{credentials:'include'})).text();" +
+  "const f=(o,k)=>{if(o&&typeof o==='object'){if(k in o)return o[k];for(const v of Object.values(o)){const r=f(v,k);if(r)return r}}};" +
+  "let s=f(JSON.parse(t),'streaming_params');if(typeof s==='string')s=JSON.parse(s);" +
+  "return {peer:s.peer_server_url,iceServers:s.ice_servers.map(x=>({urls:x.url,username:x.username,credential:x.credential}))}})()))";
 const ICE = [{ urls: [
   "stun:turn-live-007-dcm-aps1c-prod.browserstack.com:443",
   "stun:turn-live-008-dcm-aps1c-prod.browserstack.com:443",
@@ -56,7 +70,26 @@ const store = { get(k){ try { return localStorage.getItem(k) || ""; } catch { re
 $("session").value = q.get("session") || store.get("session");
 $("uid").value = q.get("uid") || store.get("uid");
 
-let ws, pinger, statsTimer, pcs = {}, pending = {}, session, uid, closing = false;
+let ws, pinger, statsTimer, pcs = {}, pending = {}, session, uid, closing = false, rtcConfig = { iceServers: ICE };
+const DEFAULT_SIGNAL = SIGNAL;
+
+function buildConfig() {
+  const cfg = { iceServers: ICE.slice() };
+  SIGNAL = DEFAULT_SIGNAL;
+  const raw = $("cfg").value.trim();
+  if (raw) {
+    const j = JSON.parse(raw);
+    if (j.peer) SIGNAL = String(j.peer).replace(/^http/, "ws").replace(/\/*$/, "/socket.io/");
+    cfg.iceServers = (j.iceServers || []).concat(ICE);
+    log("relay config loaded: " + (j.iceServers || []).length + " ice servers" + (j.peer ? ", signaling " + new URL(j.peer).host : ""));
+  }
+  if ($("forceRelay").checked) { cfg.iceTransportPolicy = "relay"; log("forcing relay-only"); }
+  return cfg;
+}
+$("copysnip").onclick = async () => {
+  try { await navigator.clipboard.writeText(SNIPPET); log("snippet copied: paste it in the console of your BrowserStack session page"); }
+  catch { $("cfg").value = SNIPPET; log("clipboard blocked: snippet placed in the box, copy it from there"); }
+};
 
 function log(msg, cls) {
   const d = document.createElement("div");
@@ -73,7 +106,9 @@ const msg = (peer, type, message) => ({
 
 function connect() {
   session = $("session").value.trim(); uid = $("uid").value.trim();
-  if (!session || !uid) { setStatus("session id and user id are required", "bad"); return; }
+  if (!/^[0-9a-f]{20,}$/i.test(session) || !/^\d+$/.test(uid)) {
+    setStatus("enter your real session id (hex) and numeric user id, not the <placeholders>", "bad"); return; }
+  try { rtcConfig = buildConfig(); } catch (err) { setStatus("relay config is not valid JSON: " + err.message, "bad"); return; }
   store.set("session", session); store.set("uid", uid);
   closing = false; pcs = {}; pending = {};
   $("go").disabled = true; $("stop").disabled = false;
@@ -132,10 +167,13 @@ async function addCandidate(pc, d) {
 
 async function onOffer(peer, d) {
   log("offer received for " + peer);
-  const pc = new RTCPeerConnection({ iceServers: ICE });
+  const pc = new RTCPeerConnection(rtcConfig);
   pcs[peer] = pc;
+  const seen = {};
   pc.onicecandidate = ev => {
-    if (!ev.candidate || ws.readyState !== 1) return;
+    if (!ev.candidate) { if (peer === "screenPeer") log("local candidates: " + JSON.stringify(seen)); return; }
+    seen[ev.candidate.type] = (seen[ev.candidate.type] || 0) + 1;
+    if (ws.readyState !== 1) return;
     const c = ev.candidate;
     emit("message", msg(peer, "fullcandidate", JSON.stringify({
       candidate:c.candidate, sdpMid:c.sdpMid, sdpMLineIndex:c.sdpMLineIndex, usernameFragment:c.usernameFragment })));
@@ -144,7 +182,13 @@ async function onOffer(peer, d) {
     log(peer + " connection: " + pc.connectionState, pc.connectionState === "connected" ? "ok" : "");
     if (peer === "screenPeer") {
       if (pc.connectionState === "connected") setStatus("LIVE", "ok");
-      if (pc.connectionState === "failed") setStatus("connection failed", "bad");
+      if (pc.connectionState === "failed") {
+        const relayCfg = rtcConfig.iceServers.some(s => /^turns?:/.test([].concat(s.urls)[0]));
+        setStatus(relayCfg
+          ? "connection failed even with the relay: check the relay config is fresh (it expires), and that no other viewer holds this session"
+          : "connection failed: your network blocks direct WebRTC. Open 'Relay config' below and paste the config from your dashboard session page.", "bad");
+        document.getElementById("relay").open = true;
+      }
     }
   };
   pc.ondatachannel = ev => log("datachannel: " + ev.channel.label);

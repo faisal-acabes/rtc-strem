@@ -6,7 +6,7 @@ Live BrowserStack App Automate device screen, received over WebRTC from BrowserS
 
 ## index.html (static, no server)
 Open the file in Chrome/Brave/Edge, fill in the session id and uid, press Connect.
-Or pre-fill: `index.html?autoconnect&session=<id>&uid=<uid>`
+Or pre-fill: `index.html?autoconnect&session=SESSION_ID&uid=USER_ID`
 
 - session id: the hex id in the dashboard URL `.../sessions/<id>`
 - uid: the `uid=` value on the dashboard's `socket.io/?tag=wspool` websocket
@@ -16,6 +16,18 @@ Or pre-fill: `index.html?autoconnect&session=<id>&uid=<uid>`
     .venv\Scripts\python streamer.py --session <id> --uid <uid>
 Serves `http://127.0.0.1:8090/stream.mjpg` (VLC/ffplay/OpenCV), `/snapshot.jpg`, `/status`.
 `--out rtsp://...|rtmp://...|srt://...` also pushes via ffmpeg.
+
+## If it says "connection failed"
+Signaling works but the media path is blocked (typical on corporate/VPN networks: no direct UDP).
+BrowserStack's own dashboard falls back to its TURN relay; this page can too, using the same relay settings from *your* session:
+
+1. Open your BrowserStack session page and press F12 (Console).
+2. Click **Copy snippet** in the viewer's "Relay config" section and paste it into the Console. Press Enter.
+3. A box appears with the config pre-selected: press Ctrl+C, then Enter.
+4. Paste into the viewer's "Relay config" box and press Connect.
+
+(The dashboard defines its own global `copy`, so the snippet uses a prompt box instead of DevTools' `copy()`.)
+The snippet reads `/api/v1/sessions/<id>` with your own login, so nothing is stored or sent anywhere except to BrowserStack's relay.
 
 ## Notes
 - Only one viewer per session: close the dashboard tab (and any other viewer) first, or no offer arrives.
