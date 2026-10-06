@@ -2,6 +2,8 @@
 
 Live BrowserStack App Automate device screen, received over WebRTC from BrowserStack's signaling server.
 
+**Download:** https://github.com/faisal-acabes/rtc-strem/releases/latest/download/bs-live-viewer.html (single file, open it in Chrome/Brave/Edge)
+
 ## index.html (static, no server)
 Open the file in Chrome/Brave/Edge, fill in the session id and uid, press Connect.
 Or pre-fill: `index.html?autoconnect&session=<id>&uid=<uid>`
