@@ -145,6 +145,7 @@ function connect() {
       setTimeout(hello, 500);
     } else if (m.startsWith("42")) {
       const [ev, p] = JSON.parse(m.slice(2));
+      if (ev !== "server_info") log("rx " + ev + " " + JSON.stringify(p).slice(0, 300));
       if (ev === "server_info") log("server_info " + JSON.stringify(p));
       else if (ev === "message" && p && p.sender === "server:") onServer(p).catch(err => log("error: " + err, "bad"));
     }
@@ -191,6 +192,9 @@ async function onOffer(peer, d) {
     emit("message", msg(peer, "fullcandidate", JSON.stringify({
       candidate:c.candidate, sdpMid:c.sdpMid, sdpMLineIndex:c.sdpMLineIndex, usernameFragment:c.usernameFragment })));
   };
+  pc.onicecandidateerror = e => log("ICE error " + e.errorCode + " " + (e.errorText || "") + " url=" + (e.url || "") + " addr=" + (e.address || "") + ":" + (e.port || ""), "bad");
+  pc.onicegatheringstatechange = () => log("ICE gathering: " + pc.iceGatheringState);
+  pc.oniceconnectionstatechange = () => log("ICE connection: " + pc.iceConnectionState);
   pc.onconnectionstatechange = () => {
     log(peer + " connection: " + pc.connectionState, pc.connectionState === "connected" ? "ok" : "");
     if (peer === "screenPeer") {
